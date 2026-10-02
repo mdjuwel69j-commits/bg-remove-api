@@ -2,263 +2,585 @@ const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
 const path = require('path');
-const fs = require('fs').promises;
+const fs = require('fs/promises');
 const { v4: uuidv4 } = require('uuid');
 const { spawn } = require('child_process');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT || 3001);
+const PYTHON_BIN = process.env.PYTHON_BIN || process.env.PYTHON || 'python3';
 
-// Middleware
+const APP_ROOT = __dirname;
+const UPLOADS_DIR = path.join(APP_ROOT, 'uploads');
+const OUTPUTS_DIR = path.join(APP_ROOT, 'outputs');
+
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// Create upload directories
-const createDirectories = async () => {
-  const dirs = ['uploads', 'outputs', 'temp'];
-  for (const dir of dirs) {
-    try {
-      await fs.mkdir(path.join(__dirname, dir), { recursive: true });
-    } catch (error) {
-      console.log(`Directory ${dir} already exists or couldn't be created`);
-    }
-  }
-};
+async function ensureDirectories() {
+  await Promise.all([
+    fs.mkdir(UPLOADS_DIR, { recursive: true }),
+    fs.mkdir(OUTPUTS_DIR, { recursive: true })
+  ]);
+}
 
-// Configure multer for file uploads
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, path.join(__dirname, 'uploads'));
-  },
-  filename: (req, file, cb) => {
-    const uniqueName = `${uuidv4()}-${file.originalname}`;
-    cb(null, uniqueName);
+  destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+  filename: (_req, file, cb) => {
+    const safeName = `${uuidv4()}${path.extname(file.originalname || '.png')}`;
+    cb(null, safeName);
   }
 });
 
 const upload = multer({
   storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: 10 * 1024 * 1024 // 10MB
   },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
-    if (allowedTypes.includes(file.mimetype)) {
+  fileFilter: (_req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+    if (allowed.includes(file.mimetype)) {
       cb(null, true);
-    } else {
-      cb(new Error('Only image files (JPEG, PNG, WebP) are allowed'));
+      return;
     }
+    cb(new Error('Only JPEG, JPG, PNG, and WebP image files are allowed.'));
   }
 });
 
-// Python model runner function
-const runPythonModel = (inputPath, outputPath) => {
+function runPythonModel(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    const modelScriptPath = path.join(__dirname, 'model.py');
-    
-    // Run the Python model script with input and output paths as arguments
-    const pythonProcess = spawn('python3', [modelScriptPath, inputPath, outputPath]);
-    
-    let output = '';
-    let error = '';
-
-    pythonProcess.stdout.on('data', (data) => {
-      output += data.toString();
+    const scriptPath = path.join(APP_ROOT, 'model.py');
+    const child = spawn(PYTHON_BIN, [scriptPath, inputPath, outputPath], {
+      cwd: APP_ROOT,
+      env: process.env
     });
 
-    pythonProcess.stderr.on('data', (data) => {
-      error += data.toString();
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
     });
 
-    pythonProcess.on('close', (code) => {
-      if (code === 0 && output.includes('SUCCESS')) {
-        resolve({ success: true, output });
-      } else {
-        reject(new Error(`Python model failed: ${error || output}`));
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('error', (error) => {
+      reject(new Error(`Failed to start Python process: ${error.message}`));
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ success: true, stdout, stderr });
+        return;
       }
-    });
 
-    pythonProcess.on('error', (err) => {
-      reject(new Error(`Failed to start Python process: ${err.message}`));
+      reject(new Error(stderr.trim() || stdout.trim() || `Python process exited with code ${code}`));
     });
   });
-};
+}
 
-// Routes
+async function cleanUpFile(filePath) {
+  if (!filePath) return;
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Background Remover API is running' });
-});
-
-// Remove background endpoint
-app.post('/remove-background', upload.single('image'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No image file provided' });
-    }
-
-    const inputPath = req.file.path;
-    const outputFileName = `processed-${req.file.filename}`;
-    const outputPath = path.join(__dirname, 'outputs', outputFileName);
-
-    console.log(`Processing image: ${req.file.originalname}`);
-    console.log(`Input path: ${inputPath}`);
-    console.log(`Output path: ${outputPath}`);
-
-    // Run Python background removal
-    await runPythonModel(inputPath, outputPath);
-
-    // Check if output file was created
-    try {
-      await fs.access(outputPath);
-    } catch (error) {
-      throw new Error('Output file was not created');
-    }
-
-    // Send the processed image back
-    res.sendFile(outputPath, (err) => {
-      if (err) {
-        console.error('Error sending file:', err);
-        res.status(500).json({ error: 'Failed to send processed image' });
-      }
-
-      // Clean up files after sending
-      setTimeout(async () => {
-        try {
-          await fs.unlink(inputPath);
-          await fs.unlink(outputPath);
-          console.log('Cleaned up temporary files');
-        } catch (cleanupError) {
-          console.log('Could not clean up files:', cleanupError);
-        }
-      }, 5000); // Clean up after 5 seconds
-    });
-
-  } catch (error) {
-    console.error('Error processing image:', error);
-    
-    // Clean up input file if it exists
-    if (req.file) {
-      try {
-        await fs.unlink(req.file.path);
-      } catch (cleanupError) {
-        console.log('Could not clean up input file:', cleanupError);
-      }
-    }
-
-    res.status(500).json({ 
-      error: 'Failed to process image', 
-      details: error.message 
-    });
+    await fs.unlink(filePath);
+  } catch (_error) {
+    // ignore cleanup errors
   }
-});
+}
 
-// Remove background with URL endpoint
-app.post('/remove-background-url', express.json(), async (req, res) => {
+async function removeBackgroundFromFile(inputPath, outputPath) {
+  await runPythonModel(inputPath, outputPath);
+
   try {
-    const { imageUrl } = req.body;
-
-    if (!imageUrl) {
-      return res.status(400).json({ error: 'No image URL provided' });
-    }
-
-    // Download image from URL
-    const response = await fetch(imageUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch image: ${response.statusText}`);
-    }
-
-    const imageBuffer = await response.arrayBuffer();
-    const fileName = `url-image-${uuidv4()}.jpg`;
-    const inputPath = path.join(__dirname, 'uploads', fileName);
-    const outputFileName = `processed-${fileName}`;
-    const outputPath = path.join(__dirname, 'outputs', outputFileName);
-
-    // Save downloaded image
-    await fs.writeFile(inputPath, Buffer.from(imageBuffer));
-
-    console.log(`Processing image from URL: ${imageUrl}`);
-    console.log(`Input path: ${inputPath}`);
-    console.log(`Output path: ${outputPath}`);
-
-    // Run Python background removal
-    await runPythonModel(inputPath, outputPath);
-
-    // Check if output file was created
-    try {
-      await fs.access(outputPath);
-    } catch (error) {
-      throw new Error('Output file was not created');
-    }
-
-    // Send the processed image back
-    res.sendFile(outputPath, (err) => {
-      if (err) {
-        console.error('Error sending file:', err);
-        res.status(500).json({ error: 'Failed to send processed image' });
-      }
-
-      // Clean up files after sending
-      setTimeout(async () => {
-        try {
-          await fs.unlink(inputPath);
-          await fs.unlink(outputPath);
-          console.log('Cleaned up temporary files');
-        } catch (cleanupError) {
-          console.log('Could not clean up files:', cleanupError);
-        }
-      }, 5000); // Clean up after 5 seconds
-    });
-
+    await fs.access(outputPath);
   } catch (error) {
-    console.error('Error processing image from URL:', error);
-    res.status(500).json({ 
-      error: 'Failed to process image from URL', 
-      details: error.message 
-    });
+    throw new Error('Output file was not created by the Python model.');
   }
+}
+
+async function processUploadedFile(inputPath, originalName) {
+  const outputFileName = `processed-${uuidv4()}${path.extname(originalName || '.png')}`;
+  const outputPath = path.join(OUTPUTS_DIR, outputFileName);
+
+  await removeBackgroundFromFile(inputPath, outputPath);
+  return { outputPath, inputPath };
+}
+
+function determineOutputExtension(contentType) {
+  const map = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/webp': '.webp'
+  };
+
+  return map[contentType] || '.png';
+}
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'OK',
+    service: 'Background Remover API',
+    version: '1.0.0'
+  });
 });
 
-// Get API info
-app.get('/', (req, res) => {
+app.get('/', (_req, res) => {
   res.json({
     name: 'Background Remover API',
     version: '1.0.0',
     endpoints: {
-      'POST /remove-background': 'Remove background from uploaded image file',
-      'POST /remove-background-url': 'Remove background from image URL',
-      'GET /health': 'Health check endpoint'
+      'GET /health': 'Check API health',
+      'POST /remove-background': 'Remove background from uploaded image',
+      'POST /remove-background-url': 'Remove background from remote image URL'
     },
     usage: {
-      'file_upload': 'Send image as multipart/form-data with field name "image"',
-      'url_processing': 'Send JSON with "imageUrl" field containing image URL'
+      upload: 'multipart/form-data with field name "image"',
+      url: 'JSON body: { "imageUrl": "https://example.com/image.jpg" }'
     }
   });
 });
 
-// Error handling middleware
-app.use((error, req, res, next) => {
+app.post('/remove-background', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image file provided.' });
+    }
+
+    const { outputPath, inputPath } = await processUploadedFile(req.file.path, req.file.originalname);
+
+    res.sendFile(outputPath, async (err) => {
+      if (err) {
+        console.error('Error sending processed image:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Unable to send processed image' });
+        }
+      }
+
+      await cleanUpFile(inputPath);
+      await cleanUpFile(outputPath);
+    });
+  } catch (error) {
+    console.error('Upload processing failed:', error);
+
+    if (req.file && req.file.path) {
+      await cleanUpFile(req.file.path);
+    }
+
+    return res.status(500).json({
+      error: 'Failed to process image',
+      details: error.message
+    });
+  }
+});
+
+app.post('/remove-background-url', async (req, res) => {
+  try {
+    const { imageUrl } = req.body || {};
+
+    if (!imageUrl || typeof imageUrl !== 'string') {
+      return res.status(400).json({ error: 'A valid imageUrl is required in JSON body.' });
+    }
+
+    const response = await fetch(imageUrl, {
+      headers: {
+        'User-Agent': 'bg-remove-api/1.0'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch remote image: ${response.status} ${response.statusText}`);
+    }
+
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    if (!contentType.startsWith('image/')) {
+      throw new Error('The remote URL did not return an image.');
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const extension = determineOutputExtension(contentType);
+    const inputPath = path.join(UPLOADS_DIR, `${uuidv4()}${extension}`);
+    const outputPath = path.join(OUTPUTS_DIR, `processed-${uuidv4()}${extension}`);
+
+    await fs.writeFile(inputPath, buffer);
+    await removeBackgroundFromFile(inputPath, outputPath);
+
+    res.sendFile(outputPath, async (err) => {
+      if (err) {
+        console.error('Error sending processed image from URL:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Unable to send processed image from URL' });
+        }
+      }
+
+      await cleanUpFile(inputPath);
+      await cleanUpFile(outputPath);
+    });
+  } catch (error) {
+    console.error('URL processing failed:', error);
+    return res.status(500).json({
+      error: 'Failed to process image from URL',
+      details: error.message
+    });
+  }
+});
+
+app.use((error, _req, res, _next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({ error: 'File too large. Maximum size is 10MB.' });
     }
   }
-  
-  console.error('Unhandled error:', error);
-  res.status(500).json({ error: 'Internal server error' });
+
+  console.error('Unhandled server error:', error);
+  return res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
-const startServer = async () => {
-  await createDirectories();
-  
-  app.listen(PORT, () => {
-    console.log(`🚀 Background Remover API running on port ${PORT}`);
-    console.log(`🏥 Health Check: ${PORT}/health`);
-  });
-};
+async function startServer() {
+  await ensureDirectories();
 
-startServer().catch(console.error);
+  app.listen(PORT, () => {
+    console.log(`Background Remover API running on port ${PORT}`);
+    console.log(`Health check: http://localhost:${PORT}/health`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
+});
 
 module.exports = app;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,7 +1,5 @@
-rembg
-onnxruntime
+rembg==2.0.57
+onnxruntime==1.18.1
 Pillow==10.4.0
 requests==2.32.3
-fastapi==0.104.1
-uvicorn==0.24.0
-python-multipart==0.0.6
+numpy>=1.26.0
